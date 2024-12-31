@@ -37,22 +37,6 @@ bytes_to_human_readable() {
 
 # Function to fetch MySQL/MariaDB stats
 fetch_mysql_stats() {
-  # Get Threads Connected and Max Connections
-  threads_connected=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW STATUS LIKE 'Threads_connected';" | awk 'NR==2 {print $2}')
-  max_connections=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW VARIABLES LIKE 'max_connections';" | awk 'NR==2 {print $2}')
-
-  # Get Active Processes (without truncating) and format output
-  active_processes=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW PROCESSLIST;")
-
-  # Get Database Sizes (only once)
-  database_sizes=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SELECT table_schema AS 'Database', SUM(data_length + index_length) / 1024 / 1024 AS 'Size (MB)' FROM information_schema.tables GROUP BY table_schema;")
-
-  # Get Server Metrics
-  queries=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW STATUS LIKE 'Questions';" | awk 'NR==2 {print $2}')
-  slow_queries=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW STATUS LIKE 'Slow_queries';" | awk 'NR==2 {print $2}')
-  uptime=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW VARIABLES LIKE 'Uptime';" | awk 'NR==2 {print $2}')
-  open_tables=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW STATUS LIKE 'Open_tables';" | awk 'NR==2 {print $2}')
-
   # Get the PID of MySQL/MariaDB
   pid=$(pgrep -o -f mysqld)
 
@@ -70,16 +54,82 @@ fetch_mysql_stats() {
   # Fetch CPU usage of MySQL/MariaDB (Check mysqld, mariadbd, mysql)
   cpu_usage=$(top -b -n1 -p "$pid" | grep -E 'mysqld|mariadbd|mysql' | awk '{print $9}')
 
-  # Fetch memory usage from /proc
-  mem_usage=$(grep VmRSS /proc/"$pid"/status | awk '{print $2}')
-
   # Handle possible null or empty values
   if [ -z "$cpu_usage" ]; then
     cpu_usage="N/A"
   fi
 
+  # Fetch memory usage from /proc
+  mem_usage=$(grep VmRSS /proc/"$pid"/status | awk '{print $2}')
+
+  # Handle possible null or empty values
   if [ -z "$mem_usage" ]; then
     mem_usage="N/A"
+  fi
+}
+
+# Function to plot the CPU usage history graph within a fixed width and height
+# TODO: better rendering on every refresh
+plot_cpu_graph() {
+  # Define a max graph height (number of rows)
+  max_height=10
+  max_width=100 # Width of the graph
+  graph_height=$max_height
+
+  # Plot the CPU usage history as a fixed 100-column wide graph with 10 rows (height)
+  echo -e "${CYAN}CPU Usage History (Last 100 Refreshes):${RESET}"
+
+  # Loop through each of the last 'max_width' CPU usage values
+  for ((row = graph_height - 1; row >= 0; row--)); do
+    # Print each row, where the CPU usage is shown vertically
+    line=""
+
+    # For each refresh, calculate the position of the bar in the current row
+    for ((col = 0; col < max_width; col++)); do
+      # Get the CPU value for this specific refresh
+      index=$((${#cpu_history[@]} - max_width + col))
+      if [ "$index" -ge 0 ]; then
+        # Get the CPU usage value
+        cpu_value="${cpu_history[$index]}"
+
+        # Handle case for CPU value 0.0
+        if [ "$cpu_value" == "0.0" ]; then
+          cpu_value=0
+        fi
+
+        # Scale the CPU value for vertical plotting (use the height of the graph)
+        scaled_value=$(echo "scale=0; $cpu_value * $graph_height / 100" | bc)
+
+        # If the row is less than or equal to the scaled value, print '#', otherwise print a space
+        if [ "$row" -lt "$scaled_value" ]; then
+          line+="#"
+        else
+          line+=" "
+        fi
+      else
+        # If no data for this column, print empty space
+        line+=" "
+      fi
+    done
+
+    # Print the row of the graph (vertical bars)
+    echo "$line"
+  done
+}
+
+# Main loop
+cpu_history=() # Array to store CPU usage history
+
+while true; do
+  clear
+  fetch_mysql_stats
+
+  # Add the new CPU usage to the history array (limit to 100 entries)
+  if [ "$cpu_usage" != "N/A" ]; then
+    cpu_history+=("$cpu_usage")
+    if [ "${#cpu_history[@]}" -gt 100 ]; then
+      cpu_history=("${cpu_history[@]:1}") # Keep only the last 100 values
+    fi
   fi
 
   # Output Results with Colors and better formatting
@@ -89,12 +139,15 @@ fetch_mysql_stats() {
   echo -e "${CYAN}------------------------------------------${RESET}"
 
   # Threads and Connections
+  threads_connected=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW STATUS LIKE 'Threads_connected';" | awk 'NR==2 {print $2}')
+  max_connections=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW VARIABLES LIKE 'max_connections';" | awk 'NR==2 {print $2}')
   echo -e "${YELLOW}Threads Connected:${RESET} $threads_connected ${YELLOW}/ Max Connections:${RESET} $max_connections"
   echo -e "${CYAN}------------------------------------------${RESET}"
 
   # Active Processes formatting
+  active_processes=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW PROCESSLIST;")
   echo -e "${CYAN}Active Processes:${RESET}"
-  echo -e "ID       User                 Host              DB                 Command    Time    State              Info"
+  echo -e "ID       User           Host             DB               Command    Time    State              Info"
   echo -e "${CYAN}------------------------------------------${RESET}"
   echo "$active_processes" | awk 'NR>1 {print $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12}' |
     while read -r id user host db command time state info; do
@@ -102,6 +155,7 @@ fetch_mysql_stats() {
     done
 
   # Database Sizes
+  database_sizes=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SELECT table_schema AS 'Database', SUM(data_length + index_length) / 1024 / 1024 AS 'Size (MB)' FROM information_schema.tables GROUP BY table_schema;")
   echo -e "${CYAN}------------------------------------------${RESET}"
   echo -e "${CYAN}Database Sizes (MB):${RESET}"
   echo "$database_sizes" | while read -r db size; do
@@ -109,6 +163,10 @@ fetch_mysql_stats() {
   done
 
   # MySQL/MariaDB Server Metrics
+  queries=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW STATUS LIKE 'Questions';" | awk 'NR==2 {print $2}')
+  slow_queries=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW STATUS LIKE 'Slow_queries';" | awk 'NR==2 {print $2}')
+  uptime=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW VARIABLES LIKE 'Uptime';" | awk 'NR==2 {print $2}')
+  open_tables=$($MYSQL_CMD -u root -p"$MYSQL_PASSWORD" -e "SHOW STATUS LIKE 'Open_tables';" | awk 'NR==2 {print $2}')
   echo -e "${CYAN}------------------------------------------${RESET}"
   echo -e "${CYAN}MySQL/MariaDB Server Metrics:${RESET}"
   echo -e "Queries: $queries"
@@ -121,12 +179,10 @@ fetch_mysql_stats() {
   echo -e "${CYAN}MySQL/MariaDB CPU and Memory Usage:${RESET} $cpu_usage % CPU, $(bytes_to_human_readable $mem_usage) Memory"
   echo -e "${CYAN}------------------------------------------${RESET}"
 
-  echo -e "${CYAN}Press Ctrl+C to exit.${RESET}"
-}
+  # Plot the CPU usage graph with fixed width and height
+  plot_cpu_graph
 
-# Main loop
-while true; do
-  clear
-  fetch_mysql_stats
+  echo -e "${CYAN}Press Ctrl+C to exit.${RESET}"
+
   sleep 2 # Refresh every 2 seconds
 done
